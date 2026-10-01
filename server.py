@@ -7,7 +7,7 @@ from flask import Flask, jsonify, send_from_directory
 app=Flask(__name__, static_folder="static")
 KALSHI="https://api.elections.kalshi.com/trade-api/v2"
 COINBASE="https://api.exchange.coinbase.com/products/BTC-USD/ticker"
-samples=deque(maxlen=900); state={"ok":False,"error":"Starting..."}
+samples=deque(maxlen=900); state={"ok":False,"error":"Starting..."}; state_lock=threading.Lock()
 
 POS=set("surge rally rises rising bullish breakout gain gains strong stronger up upside approval adoption inflow inflows demand buy buying positive beat beats growth record high higher".split())
 NEG=set("crash falls falling bearish breakdown loss losses weak weaker down downside outflow outflows sell selling negative fear hack hacked fraud ban bans lawsuit risk risks liquidation liquidations".split())
@@ -121,19 +121,39 @@ def compute():
             "sentiment_label":"Bullish" if sent>.15 else "Bearish" if sent<-.15 else "Neutral",
             "reasons":reasons,"headlines":heads,"error":""}
 
-def loop():
+def update_state():
     global state
+    try:
+        new_state=compute()
+    except Exception as e:
+        new_state={"ok":False,"action":"WAIT","error":f"Data update failed: {e}"}
+    with state_lock:
+        state=new_state
+    return new_state
+
+def loop():
     while True:
-        try: state=compute()
-        except Exception as e: state={"ok":False,"action":"WAIT","error":str(e)}
+        update_state()
         time.sleep(2)
 
+# Start the data worker when running under Gunicorn/Render too.
+# (Gunicorn imports this module instead of executing __main__.)
+_worker=threading.Thread(target=loop,daemon=True)
+_worker.start()
+
 @app.get("/api/state")
-def api_state(): return jsonify(state)
+def api_state():
+    # On Render/free instances the background worker can occasionally be
+    # delayed or restarted. If no successful state exists yet, perform a
+    # synchronous first update so the API cannot remain stuck on "Starting...".
+    with state_lock:
+        current=dict(state)
+    if not current.get("ok") and current.get("error") == "Starting...":
+        current=update_state()
+    return jsonify(current)
 
 @app.get("/")
 def index(): return send_from_directory("static","index.html")
 
 if __name__=="__main__":
-    threading.Thread(target=loop,daemon=True).start()
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","8080")))
