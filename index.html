@@ -53,12 +53,31 @@ small{color:var(--muted)}.error{color:var(--red);font-size:12px;margin-top:8px}
 </main>
 <script>
 const API="/api/state";
-function pct(x){return (x*100).toFixed(1)+"%"} function usd(x){return "$"+Number(x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+let countdownEndMs=null;
+
+function pct(x){return (x*100).toFixed(1)+"%"}
+function usd(x){return "$"+Number(x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+
+function drawCountdown(){
+ const el=document.getElementById("time");
+ if(countdownEndMs===null){el.textContent="--";return}
+ const left=Math.max(0,(countdownEndMs-Date.now())/1000);
+ const mins=Math.floor(left/60);
+ const secs=Math.floor(left%60);
+ el.textContent=mins+":"+String(secs).padStart(2,"0");
+}
+
 function render(d){
  document.getElementById("live").textContent=d.ok?"● LIVE":"OFFLINE";
  document.getElementById("btc").textContent=d.btc?usd(d.btc):"--";
  document.getElementById("target").textContent=d.strike?usd(d.strike):"--";
- document.getElementById("time").textContent=d.seconds_left!=null?Math.floor(d.seconds_left/60)+":"+String(Math.floor(d.seconds_left%60)).padStart(2,"0"):"--";
+ if(d.seconds_left!=null){
+   countdownEndMs=Date.now()+Math.max(0,Number(d.seconds_left))*1000;
+   drawCountdown();
+ }else{
+   countdownEndMs=null;
+   drawCountdown();
+ }
  document.getElementById("price").textContent=d.yes_ask!=null?(d.yes_ask*100).toFixed(1)+"¢":"--";
  document.getElementById("prob").textContent=d.p_up!=null?pct(d.p_up)+" UP probability":"--";
  document.getElementById("up").textContent="UP "+(d.p_up!=null?pct(d.p_up):"--");
@@ -76,5 +95,7 @@ function render(d){
  document.getElementById("error").textContent=d.error||"";
 }
 async function tick(){try{let r=await fetch(API+"?t="+Date.now());let d=await r.json();render(d)}catch(e){document.getElementById("live").textContent="OFFLINE";document.getElementById("error").textContent="Server connection lost. Tap Reconnect."}}
-tick();setInterval(tick,2000);
+tick();
+setInterval(tick,2000);
+setInterval(drawCountdown,250);
 </script></body></html>
