@@ -128,6 +128,11 @@ def loop():
         except Exception as e: state={"ok":False,"action":"WAIT","error":str(e)}
         time.sleep(2)
 
+# Start the data worker when running under Gunicorn/Render too.
+# (Gunicorn imports this module instead of executing __main__.)
+_worker=threading.Thread(target=loop,daemon=True)
+_worker.start()
+
 @app.get("/api/state")
 def api_state(): return jsonify(state)
 
@@ -135,5 +140,4 @@ def api_state(): return jsonify(state)
 def index(): return send_from_directory("static","index.html")
 
 if __name__=="__main__":
-    threading.Thread(target=loop,daemon=True).start()
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","8080")))
