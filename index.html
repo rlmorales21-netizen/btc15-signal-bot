@@ -52,7 +52,6 @@ small{color:var(--muted)}.error{color:var(--red);font-size:12px;margin-top:8px}
 <small style="display:block;text-align:center;margin-top:12px">No orders are placed. This is a probability signal, not a guarantee.</small>
 </main>
 <script>
-const API="/api/state";
 let countdownEndMs=null;
 
 function pct(x){return (x*100).toFixed(1)+"%"}
@@ -71,31 +70,34 @@ function render(d){
  document.getElementById("live").textContent=d.ok?"● LIVE":"OFFLINE";
  document.getElementById("btc").textContent=d.btc?usd(d.btc):"--";
  document.getElementById("target").textContent=d.strike?usd(d.strike):"--";
- if(d.seconds_left!=null){
-   countdownEndMs=Date.now()+Math.max(0,Number(d.seconds_left))*1000;
-   drawCountdown();
- }else{
-   countdownEndMs=null;
-   drawCountdown();
- }
+ if(d.seconds_left!=null){countdownEndMs=Date.now()+Math.max(0,Number(d.seconds_left))*1000;drawCountdown();}
+ else{countdownEndMs=null;drawCountdown();}
  document.getElementById("price").textContent=d.yes_ask!=null?(d.yes_ask*100).toFixed(1)+"¢":"--";
  document.getElementById("prob").textContent=d.p_up!=null?pct(d.p_up)+" UP probability":"--";
  document.getElementById("up").textContent="UP "+(d.p_up!=null?pct(d.p_up):"--");
  document.getElementById("down").textContent="DOWN "+(d.p_down!=null?pct(d.p_down):"--");
- document.getElementById("fill").style.width=(d.p_up*100||50)+"%";
+ document.getElementById("fill").style.width=(d.p_up!=null?d.p_up*100:50)+"%";
  document.getElementById("edge").textContent=d.edge!=null?"Executable edge "+(d.edge*100).toFixed(1)+" percentage points":"--";
  document.getElementById("mom").textContent=d.momentum_label||"--";
  document.getElementById("vol").textContent=d.volatility_label||"--";
  document.getElementById("book").textContent=d.book_label||"--";
  document.getElementById("sent").textContent=d.sentiment_label||"--";
- const s=document.getElementById("signal"); s.className="signal "+(d.action==="BUY UP"?"up":d.action==="BUY DOWN"?"down":"wait");
+ const s=document.getElementById("signal");s.className="signal "+(d.action==="BUY UP"?"up":d.action==="BUY DOWN"?"down":"wait");
  document.getElementById("action").textContent=d.action||"WAIT";
- const r=document.getElementById("reasons"); r.innerHTML=(d.reasons||[]).map(x=>`<div class="reason ${x.type}">${x.text}</div>`).join("");
+ document.getElementById("reasons").innerHTML=(d.reasons||[]).map(x=>`<div class="reason ${x.type}">${x.text}</div>`).join("");
  document.getElementById("news").innerHTML=(d.headlines||[]).map(x=>`<div class="news">${x.title}<br><span>${x.score>0?"Bullish":x.score<0?"Bearish":"Neutral"} • ${x.source||""}</span></div>`).join("")||"<small>No headlines yet.</small>";
  document.getElementById("error").textContent=d.error||"";
 }
-async function tick(){try{let r=await fetch(API+"?t="+Date.now());let d=await r.json();render(d)}catch(e){document.getElementById("live").textContent="OFFLINE";document.getElementById("error").textContent="Server connection lost. Tap Reconnect."}}
-tick();
-setInterval(tick,2000);
-setInterval(drawCountdown,250);
+
+function connect(){
+ const live=document.getElementById("live");
+ live.textContent="CONNECTING";
+ const es=new EventSource("/api/stream");
+ es.addEventListener("state",e=>{try{render(JSON.parse(e.data));}catch(_){}});
+ es.onopen=()=>{live.textContent="● LIVE";};
+ es.onerror=()=>{live.textContent="RECONNECTING";};
+}
+
+connect();
+setInterval(drawCountdown,100);
 </script></body></html>
