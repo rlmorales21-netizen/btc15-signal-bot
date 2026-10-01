@@ -5,7 +5,7 @@ import requests
 from flask import Flask, jsonify, send_from_directory
 
 app=Flask(__name__, static_folder="static")
-KALSHI="https://api.elections.kalshi.com/trade-api/v2"
+KALSHI="https://external-api.kalshi.com/trade-api/v2"
 COINBASE="https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 samples=deque(maxlen=900); state={"ok":False,"error":"Starting..."}; state_lock=threading.Lock()
 
@@ -40,32 +40,45 @@ def sentiment():
         return 0,[]
 
 def market():
-    j=get(KALSHI+"/markets",{"series_ticker":"KXBTC15M","status":"open","limit":20})
+    # Public Kalshi market-data endpoint. Pull the KXBTC15M series and
+    # choose the next contract whose close time is still in the future.
+    j=get(KALSHI+"/markets",{"series_ticker":"KXBTC15M","status":"open","limit":100})
     ms=j.get("markets",[])
-    if not ms:return None
-    # Choose the contract closing soonest but still open.
+    if not ms:
+        # Fallback: some API responses can omit the open filter while a
+        # market is still active. Filter the returned series ourselves.
+        j=get(KALSHI+"/markets",{"series_ticker":"KXBTC15M","limit":100})
+        ms=j.get("markets",[])
     now=time.time()
-    ms=[m for m in ms if iso(m.get("close_time")) and iso(m["close_time"])>=now]
-    if not ms:return None
-    return min(ms,key=lambda m:iso(m["close_time"]))
+    live=[]
+    for m in ms:
+        ct=iso(m.get("close_time"))
+        if ct is not None and ct >= now:
+            status=str(m.get("status","")).lower()
+            if status in ("", "open", "active"):
+                live.append(m)
+    if not live:
+        return None
+    return min(live,key=lambda m:iso(m["close_time"]))
 
 def orderbook(ticker):
     try:
         j=get(f"{KALSHI}/markets/{ticker}/orderbook")
         ob=j.get("orderbook_fp") or j.get("orderbook") or {}
-        # Kalshi schema may expose yes/no arrays. Sum top levels.
-        yes=ob.get("yes",[]) or []; no=ob.get("no",[]) or []
+        yes=ob.get("yes_dollars") or ob.get("yes") or []
+        no=ob.get("no_dollars") or ob.get("no") or []
         y=sum(float(x[1]) for x in yes[:10] if len(x)>1)
         n=sum(float(x[1]) for x in no[:10] if len(x)>1)
         if y+n==0:return 0
         return (y-n)/(y+n)
-    except Exception:return 0
+    except Exception:
+        return 0
 
 def compute():
     btc=float(get(COINBASE)["price"]); now=time.time()
     samples.append((now,btc))
     m=market()
-    if not m:return {"ok":True,"btc":btc,"action":"WAIT","error":"No open KXBTC15M market found."}
+    if not m:return {"ok":True,"btc":btc,"action":"WAIT","error":"No active KXBTC15M market found."}
     strike=m.get("floor_strike",m.get("strike"))
     strike=float(strike) if strike is not None else None
     left=max(0,iso(m["close_time"])-now)
@@ -86,8 +99,25 @@ def compute():
         z=math.log(btc/strike)/(sigma*math.sqrt(left))
         p_up=max(.001,min(.999,.5*(1+math.erf(z/math.sqrt(2)))))
     else:p_up=.5
-    yb=float(m.get("yes_bid",0))/100; ya=float(m.get("yes_ask",0))/100
-    if ya==0: ya=yb
+    def dollars(m,key):
+        v=m.get(key+"_dollars")
+        if v is None:
+            v=m.get(key)
+        try:
+            v=float(v)
+            # Legacy integer-cent fields are 1..100; *_dollars are 0..1.
+            if v>1.0:
+                v/=100.0
+            return max(0.0,min(1.0,v))
+        except Exception:
+            return 0.0
+
+    yb=dollars(m,"yes_bid")
+    ya=dollars(m,"yes_ask")
+    nb=dollars(m,"no_bid")
+    na=dollars(m,"no_ask")
+    if ya==0 and yb>0: ya=yb
+    if na==0 and nb>0: na=nb
     book=orderbook(m["ticker"])
     sent,heads=sentiment()
     # Momentum: compare current to observations ~60s and ~180s ago.
@@ -98,12 +128,17 @@ def compute():
     m60=(btc/p60-1) if p60 else 0
     m180=(btc/p180-1) if p180 else 0
     momentum=0.6*max(-1,min(1,m60/0.002))+0.4*max(-1,min(1,m180/0.004))
-    # Combine the price-to-strike probability with momentum, order book and news sentiment.
-    adj=p_up + 0.07*momentum + 0.04*book + 0.03*sent
-    adj=max(.001,min(.999,adj))
+    # Blend technical probability with the live Kalshi midpoint instead of
+    # allowing the model to jump to ~100% from a single price/strike snapshot.
+    kalshi_mid=(yb+ya)/2 if (yb or ya) else 0.5
+    technical=0.5 + 0.40*math.tanh(z/1.8) if strike and left>0 else 0.5
+    technical += 0.07*momentum + 0.04*book + 0.03*sent
+    technical=max(0.08,min(0.92,technical))
+    adj=0.70*technical + 0.30*kalshi_mid
+    adj=max(.05,min(.95,adj))
     p_down=1-adj
     yes_edge=adj-ya
-    no_edge=p_down-(1-yb if yb else .5)
+    no_edge=p_down-na if na else 0.0
     if yes_edge>=.07 and adj>=.66: action="BUY UP"; edge=yes_edge
     elif no_edge>=.07 and p_down>=.66: action="BUY DOWN"; edge=no_edge
     else: action="WAIT"; edge=max(yes_edge,no_edge)
@@ -114,7 +149,9 @@ def compute():
     reasons.append({"type":"good" if momentum>0.15 else "bad" if momentum<-0.15 else "neutral","text":f"Short-term momentum: {momentum*100:+.1f} normalized."})
     reasons.append({"type":"good" if book>0.15 else "bad" if book<-0.15 else "neutral","text":f"Order-book imbalance: {book*100:+.1f}%."})
     reasons.append({"type":"good" if sent>0.15 else "bad" if sent<-0.15 else "neutral","text":f"News sentiment: {sent*100:+.1f}%."})
-    return {"ok":True,"btc":btc,"strike":strike,"seconds_left":left,"yes_ask":ya,"p_up":adj,"p_down":p_down,
+    return {"ok":True,"btc":btc,"strike":strike,"seconds_left":left,
+            "yes_bid":yb,"yes_ask":ya,"no_bid":nb,"no_ask":na,
+            "p_up":adj,"p_down":p_down,
             "edge":edge,"action":action,"momentum_label":"Bullish" if momentum>.15 else "Bearish" if momentum<-.15 else "Mixed",
             "volatility_label":"Elevated" if sigma>0.00000009 else "Normal",
             "book_label":"Bid-heavy" if book>.15 else "Ask-heavy" if book<-.15 else "Balanced",
