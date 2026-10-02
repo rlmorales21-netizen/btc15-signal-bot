@@ -257,8 +257,6 @@ _worker.start()
 def api_state():
     with state_lock:
         current = dict(state)
-    if not current.get("ok") and current.get("error") == "Starting...":
-        current = update_state()
     response = jsonify(current)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
