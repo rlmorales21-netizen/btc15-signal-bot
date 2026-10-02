@@ -1,3 +1,12 @@
+# Gevent must patch the standard library BEFORE requests/urllib3 are imported,
+# otherwise network calls can hang silently under gunicorn's gevent worker.
+try:
+    from gevent import monkey
+
+    monkey.patch_all()
+except ImportError:  # running without gevent (plain `python server.py`)
+    pass
+
 import csv
 import json
 import math
