@@ -21,6 +21,38 @@ from datetime import datetime
 import requests
 from flask import Flask, Response, jsonify, send_from_directory, stream_with_context
 
+# --- Network hardening ---------------------------------------------------------
+# 1) IPv4 only. Many hosts (including some containers) cannot route IPv6, and urllib3
+#    otherwise waits out a full connect timeout on every IPv6 address before trying IPv4.
+import socket
+import urllib3.util.connection as _urllib3_connection
+
+_urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
+
+# 2) Cache DNS answers for 5 minutes (and reuse a stale answer if a lookup fails), so
+#    opening a connection does not depend on a slow or flaky resolver every time.
+_orig_getaddrinfo = socket.getaddrinfo
+_dns_cache = {}
+
+
+def _cached_getaddrinfo(host, port, *args, **kwargs):
+    key = (host, port, args, tuple(sorted(kwargs.items())))
+    now = time.time()
+    hit = _dns_cache.get(key)
+    if hit and now - hit[0] < 300:
+        return hit[1]
+    try:
+        result = _orig_getaddrinfo(host, port, *args, **kwargs)
+    except Exception:
+        if hit:
+            return hit[1]
+        raise
+    _dns_cache[key] = (now, result)
+    return result
+
+
+socket.getaddrinfo = _cached_getaddrinfo
+
 app = Flask(__name__, static_folder="static")
 STARTED = time.time()
 
@@ -87,7 +119,7 @@ _session.headers.update({"User-Agent": "BTC15-Signal-Bot/1.2"})
 
 
 def get(url, params=None):
-    r = _session.get(url, params=params, timeout=(5.0, 8.0))
+    r = _session.get(url, params=params, timeout=(4.0, 8.0))
     r.raise_for_status()
     return r.json()
 
@@ -241,6 +273,26 @@ def poll_sentiment():
     put("sentiment", (average, headlines))
 
 
+def call_with_deadline(fn, seconds):
+    """Run fn, but never wait longer than `seconds`. A hang becomes a visible error."""
+    box = {}
+
+    def target():
+        try:
+            box["ok"] = fn()
+        except Exception as exc:
+            box["err"] = exc
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError(f"request hung for more than {seconds:.0f}s")
+    if "err" in box:
+        raise box["err"]
+    return box.get("ok")
+
+
 def run_forever(name, fn, interval, retry=None):
     """Run fn on its own thread. On failure keep the last good value and retry sooner."""
 
@@ -248,7 +300,7 @@ def run_forever(name, fn, interval, retry=None):
         while True:
             delay = interval
             try:
-                fn()
+                call_with_deadline(fn, 20)
                 feed_errors.pop(name, None)
             except Exception as exc:
                 msg = f"{type(exc).__name__}: {exc}"[:300]
