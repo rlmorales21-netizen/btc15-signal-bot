@@ -13,6 +13,7 @@ import requests
 from flask import Flask, Response, jsonify, send_from_directory, stream_with_context
 
 app = Flask(__name__, static_folder="static")
+STARTED = time.time()
 
 # Public Kalshi market-data API. No trading credentials are used.
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -146,13 +147,15 @@ ENABLED = [n for n in os.getenv("PRICE_FEEDS", "coinbase,kraken,bitstamp,gemini"
 def reference():
     """Median of fresh exchange prices: a PROXY for CF Benchmarks BRTI, not BRTI itself."""
     now = time.time()
-    vals = []
+    vals, notes = [], []
     for name in ENABLED:
         ts, v = read("px_" + name)
-        if v is not None and now - ts < 5:
+        if v is not None and now - ts < 15:
             vals.append(v)
+        else:
+            notes.append(f"{name}: " + ("no data yet" if v is None else f"{now - ts:.0f}s old"))
     if not vals:
-        raise RuntimeError("No BTC price feeds available")
+        raise RuntimeError("No BTC price feeds available (" + "; ".join(notes) + ")")
     return statistics.median(vals), len(vals)
 
 
@@ -237,7 +240,10 @@ def run_forever(name, fn, interval, retry=None):
                 fn()
                 feed_errors.pop(name, None)
             except Exception as exc:
-                feed_errors[name] = f"{type(exc).__name__}: {exc}"
+                msg = f"{type(exc).__name__}: {exc}"[:300]
+                if feed_errors.get(name) != msg:
+                    print(f"[{name}] {msg}", flush=True)  # shows up in the Render log
+                feed_errors[name] = msg
                 delay = retry or interval
             time.sleep(delay)
 
@@ -722,6 +728,7 @@ if ALERT_ON_START and (NTFY_TOPIC or (TG_TOKEN and TG_CHAT)):
         daemon=True,
     ).start()
 start_price_feeds()
+print(f"started; price feeds: {ENABLED}", flush=True)
 run_forever("market", poll_market, 1.5, retry=3)
 run_forever("sentiment", poll_sentiment, 120, retry=20)  # failures retry fast, keep last headlines
 run_forever("outcomes", poll_outcomes, 30)
@@ -738,7 +745,13 @@ def no_cache(response):
 def health():
     with state_lock:
         current = dict(state)
-    return jsonify({"ok": bool(current.get("ok")), "error": current.get("error", ""), "feeds": feed_errors})
+    return jsonify({
+        "ok": bool(current.get("ok")),
+        "error": current.get("error", ""),
+        "feeds": feed_errors,
+        "uptime_s": round(time.time() - STARTED),
+        "price_feeds": ENABLED,
+    })
 
 
 @app.get("/api/state")
