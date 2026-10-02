@@ -79,13 +79,15 @@ NEG = set(
 
 
 # --- Helpers ------------------------------------------------------------------
+# One shared session: reuses connections instead of redoing DNS/TLS on every call,
+# which matters a lot on small, slow instances.
+_session = requests.Session()
+_session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16))
+_session.headers.update({"User-Agent": "BTC15-Signal-Bot/1.2"})
+
+
 def get(url, params=None):
-    r = requests.get(
-        url,
-        params=params,
-        timeout=(2.5, 4.0),
-        headers={"User-Agent": "BTC15-Signal-Bot/1.1"},
-    )
+    r = _session.get(url, params=params, timeout=(5.0, 8.0))
     r.raise_for_status()
     return r.json()
 
@@ -725,7 +727,7 @@ def start_price_feeds():
     for name in ENABLED:
         def work(name=name, fn=EXCHANGES[name]):
             put("px_" + name, fn())
-        run_forever("px_" + name, work, 1.0, retry=2)
+        run_forever("px_" + name, work, 1.5, retry=2)
 
 
 load_pending()
@@ -738,7 +740,7 @@ if ALERT_ON_START and (NTFY_TOPIC or (TG_TOKEN and TG_CHAT)):
     ).start()
 start_price_feeds()
 print(f"started; price feeds: {ENABLED}", flush=True)
-run_forever("market", poll_market, 1.5, retry=3)
+run_forever("market", poll_market, 2.0, retry=3)
 run_forever("sentiment", poll_sentiment, 120, retry=20)  # failures retry fast, keep last headlines
 run_forever("outcomes", poll_outcomes, 30)
 threading.Thread(target=loop, name="signal-updater", daemon=True).start()
