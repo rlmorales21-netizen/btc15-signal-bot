@@ -754,6 +754,40 @@ def health():
     })
 
 
+_probe_last = 0.0
+
+
+@app.get("/probe")
+def probe():
+    """Live connectivity test: fetches each upstream once, right now, and reports timing/errors."""
+    global _probe_last
+    if time.time() - _probe_last < 5:
+        return jsonify({"error": "wait a few seconds between probes"}), 429
+    _probe_last = time.time()
+
+    targets = dict(EXCHANGES)
+    targets["kalshi"] = lambda: len(get(f"{KALSHI}/markets", {"series_ticker": SERIES, "status": "open", "limit": 5}).get("markets", []))
+    out = {}
+
+    def run(name, fn):
+        t0 = time.time()
+        try:
+            out[name] = {"result": fn(), "seconds": round(time.time() - t0, 2)}
+        except Exception as exc:
+            out[name] = {"error": f"{type(exc).__name__}: {exc}"[:200], "seconds": round(time.time() - t0, 2)}
+
+    workers = [threading.Thread(target=run, args=(n, f), daemon=True) for n, f in targets.items()]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(timeout=9)
+    for n in targets:
+        out.setdefault(n, {"error": "no answer within 9 seconds (request is hanging)"})
+    out["threads"] = sorted(t.name for t in threading.enumerate())
+    out["feeds_have_data"] = {n: read("px_" + n)[1] is not None for n in ENABLED}
+    return no_cache(jsonify(out))
+
+
 @app.get("/api/state")
 def api_state():
     with state_lock:
