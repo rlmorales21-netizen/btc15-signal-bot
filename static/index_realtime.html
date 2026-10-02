@@ -93,7 +93,7 @@ function connect(){
  const live=document.getElementById("live");
  live.textContent="CONNECTING";
  const es=new EventSource("/api/stream");
- es.addEventListener("state",e=>{try{render(JSON.parse(e.data));}catch(_){}});
+ es.onmessage=e=>{try{render(JSON.parse(e.data));}catch(_){}};
  es.onopen=()=>{live.textContent="● LIVE";};
  es.onerror=()=>{live.textContent="RECONNECTING";};
 }
