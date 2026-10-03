@@ -11,7 +11,7 @@
 html,body{height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 main{zoom:var(--z,1);height:calc(100dvh / var(--z,1));max-width:1000px;margin:auto;padding:max(8px,env(safe-area-inset-top)) 10px max(8px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:7px}
 .top{display:flex;justify-content:space-between;align-items:center}.title{font-weight:800;font-size:16px}
-.live{font-size:12px;font-weight:700}.live.ok{color:var(--green)}.live.bad{color:var(--red)}
+.chip{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap}.live{font-size:12px;font-weight:700}.live.ok{color:var(--green)}.live.bad{color:var(--red)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px 10px;min-width:0}
 .k{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .v{font-size:clamp(14px,2.4vh,18px);font-weight:750;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -46,7 +46,7 @@ button{padding:5px 10px;border:1px solid var(--line);border-radius:8px;backgroun
 @media(max-width:759px) and (max-height:700px){.rec{display:none}}
 </style></head>
 <body><main>
-<div class="top"><div class="title">BTC 15-Minute Signal</div><div class="live bad" id="live">CONNECTING</div></div>
+<div class="top"><div class="title">BTC 15-Minute Signal</div><div class="chip" id="chip"></div><div class="live bad" id="live">CONNECTING</div></div>
 <div class="check" id="check">Waiting for live data…</div>
 <div class="cols">
  <div class="col">
@@ -71,6 +71,7 @@ button{padding:5px 10px;border:1px solid var(--line);border-radius:8px;backgroun
   <div class="card why" id="reasons"><div>Collecting live data…</div></div>
   <div class="card news" id="news"></div>
   <div class="rec" id="stats"></div>
+  <div class="rec" id="paper"></div>
  </div>
 </div>
 <div class="foot"><span class="err" id="error"></span><span>Signal only, no orders placed.</span><button onclick="location.reload()">Reconnect</button></div>
@@ -161,4 +162,16 @@ function connect(){
  es.onerror=()=>{const lv=$("live");lv.textContent="RECONNECTING";lv.className="live bad";$("error").textContent="Live stream reconnecting…"};
 }
 fit();addEventListener('resize',fit);connect();loadStats();setInterval(loadStats,60000);setInterval(drawCountdown,250);
+async function loadPaper(){
+ try{
+  const d=await (await fetch("/api/paper",{cache:"no-store"})).json();
+  const m=d[d.primary],o=d[d.primary==="fractional"?"whole":"fractional"];
+  const sg=x=>(x>=0?"+":"-")+Math.abs(x).toFixed(1)+"%";
+  const chip=$("chip");chip.textContent="Paper $"+m.bankroll.toFixed(2);chip.title="Paper bankroll ("+m.mode+"), started at $"+m.start.toFixed(2);
+  chip.style.color=m.bankroll>m.start+0.0049?"var(--green)":m.bankroll<m.start-0.0049?"var(--red)":"var(--muted)";
+  const line=x=>x.mode+": $"+x.bankroll.toFixed(2)+" ("+sg(x.return_pct)+") \u00b7 "+x.wins+"/"+x.settled+" won"+(x.avg_stake_pct!=null?" \u00b7 avg buy "+x.avg_stake_pct.toFixed(1)+"% of bankroll":"")+(x.skipped?" \u00b7 "+x.skipped+" skipped":"")+(x.max_drawdown_pct>0?" \u00b7 worst drop -"+x.max_drawdown_pct.toFixed(1)+"%":"");
+  $("paper").textContent="Paper bankroll from $"+m.start.toFixed(2)+", target "+m.stake_pct+"% per buy \u2014 "+line(m)+" | "+line(o)+(m.open?" | open: "+m.open.action:"");
+ }catch(e){$("paper").textContent="";$("chip").textContent=""}
+}
+loadPaper();setInterval(loadPaper,60000);
 </script></body></html>
