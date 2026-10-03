@@ -966,6 +966,139 @@ def loop():
         time.sleep(0.5)
 
 
+# --- Optional: save results to a private GitHub repo so they survive Render restarts ---------
+# Inactive unless GITHUB_TOKEN and GITHUB_DATA_REPO are set. Saves only alerts.csv and
+# outcomes.csv (a few rows per market). On startup it merges the saved copy back in.
+import base64
+import hashlib
+import io
+
+GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GH_REPO = os.getenv("GITHUB_DATA_REPO", "").strip()           # "owner/name"
+GH_BRANCH = os.getenv("GITHUB_DATA_BRANCH", "main").strip()
+GH_API = os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+GH_ENABLED = bool(GH_TOKEN and GH_REPO)
+GH_FILES = {"alerts.csv": (ALERTS_CSV, ALERT_FIELDS), "outcomes.csv": (OUTCOMES_CSV, OUTCOME_FIELDS)}
+_gh_state = {n: {"ready": False, "sha": None, "remote_lines": 0, "pushed_hash": None} for n in GH_FILES}
+_gh_lock = threading.Lock()
+
+
+def _gh(method, name, accept="application/vnd.github+json", **kw):
+    headers = {
+        "Authorization": f"Bearer {GH_TOKEN}", "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "BTC15-Signal-Bot",
+    }
+    return requests.request(method, f"{GH_API}/repos/{GH_REPO}/contents/{name}",
+                            headers=headers, timeout=(5.0, 10.0), **kw)
+
+
+def _merge_csv(path, fields, remote_rows):
+    """Remote rows first, then any local rows the remote lacks; always written with the current columns."""
+    with log_lock:
+        local_rows = read_csv(path)
+        seen = {r.get("ticker") for r in remote_rows}
+        merged = remote_rows + [r for r in local_rows if r.get("ticker") not in seen]
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", restval="")
+            w.writeheader()
+            w.writerows(merged)
+        os.replace(tmp, path)
+
+
+def pending_from_alerts():
+    """After a restart, markets decided but not yet settled still need their results recorded."""
+    settled = {r["ticker"] for r in read_csv(OUTCOMES_CSV)}
+    for r in read_csv(ALERTS_CSV):
+        if r.get("ticker") and r["ticker"] not in settled:
+            try:
+                pending[r["ticker"]] = float(r["ts"]) + float(r["seconds_left"])
+            except (ValueError, KeyError, TypeError):
+                pass
+
+
+def _gh_restore_file(name):
+    """Pull the saved copy and merge it in. Returns True if local gained rows. Marks the file ready."""
+    st, (path, fields) = _gh_state[name], GH_FILES[name]
+    r = _gh("GET", name, params={"ref": GH_BRANCH})
+    if r.status_code == 404:  # nothing saved yet
+        st.update(ready=True, sha=None, remote_lines=0)
+        return False
+    r.raise_for_status()
+    meta = r.json()
+    st["sha"] = meta.get("sha")
+    if meta.get("content"):
+        raw = base64.b64decode(meta["content"])
+    else:  # larger than 1 MB: ask for the raw bytes
+        g = _gh("GET", name, accept="application/vnd.github.raw+json", params={"ref": GH_BRANCH})
+        g.raise_for_status()
+        raw = g.content
+    st["remote_lines"] = raw.count(b"\n")
+    remote_rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig", errors="replace"))))
+    local_keys = {r.get("ticker") for r in read_csv(path)}
+    changed = any(r.get("ticker") not in local_keys for r in remote_rows)
+    if changed:
+        _merge_csv(path, fields, remote_rows)
+    st["ready"] = True
+    return changed
+
+
+def _gh_push_file(name):
+    st, (path, _) = _gh_state[name], GH_FILES[name]
+    if not st["ready"] or not os.path.exists(path):  # never write before we know what is saved
+        return
+    with open(path, "rb") as f:
+        data = f.read()
+    digest = hashlib.sha1(data).hexdigest()
+    if digest == st["pushed_hash"]:
+        return
+    if data.count(b"\n") < st["remote_lines"]:
+        print(f"[github] {name}: local copy has fewer rows than the saved one; not overwriting", flush=True)
+        return
+    body = {"message": f"data sync {name}", "content": base64.b64encode(data).decode(), "branch": GH_BRANCH}
+    if st["sha"]:
+        body["sha"] = st["sha"]
+    r = _gh("PUT", name, json=body)
+    if r.status_code in (409, 422):  # file changed underneath us: refresh its version and retry once
+        g = _gh("GET", name, params={"ref": GH_BRANCH})
+        if g.status_code == 200:
+            body["sha"] = st["sha"] = g.json().get("sha")
+        elif g.status_code == 404:
+            body.pop("sha", None)
+            st["sha"] = None
+        r = _gh("PUT", name, json=body)
+    r.raise_for_status()
+    st.update(sha=r.json()["content"]["sha"], pushed_hash=digest, remote_lines=data.count(b"\n"))
+
+
+def github_sync():
+    if not _gh_lock.acquire(blocking=False):
+        return
+    try:
+        gained = False
+        for name in GH_FILES:
+            if not _gh_state[name]["ready"]:
+                gained = _gh_restore_file(name) or gained
+        if gained:
+            load_alerted()
+            pending_from_alerts()
+        for name in GH_FILES:
+            _gh_push_file(name)
+    finally:
+        _gh_lock.release()
+
+
+def restore_from_github():
+    if not GH_ENABLED:
+        return
+    print(f"[github] saving results to {GH_REPO} ({GH_BRANCH})", flush=True)
+    t = threading.Thread(target=github_sync, daemon=True)
+    t.start()
+    t.join(15)  # give the first restore a short head start; the loop below keeps retrying
+    run_forever("github_sync", github_sync, 120, retry=60)
+
+
 def start_price_feeds():
     for name in ENABLED:
         def work(name=name, fn=EXCHANGES[name]):
@@ -973,6 +1106,7 @@ def start_price_feeds():
         run_forever("px_" + name, work, 1.5, retry=2)
 
 
+restore_from_github()  # does nothing unless GITHUB_TOKEN and GITHUB_DATA_REPO are set
 load_pending()
 load_alerted()
 if ALERT_ON_START and (NTFY_TOPIC or (TG_TOKEN and TG_CHAT)):
