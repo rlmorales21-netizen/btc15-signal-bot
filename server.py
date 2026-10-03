@@ -19,7 +19,7 @@ from collections import deque
 from datetime import datetime
 
 import requests
-from flask import Flask, Response, jsonify, send_from_directory, stream_with_context
+from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
 # --- Network hardening ---------------------------------------------------------
 # 1) IPv4 only. Many hosts (including some containers) cannot route IPv6, and urllib3
@@ -1223,6 +1223,114 @@ def api_stream():
 @app.get("/")
 def index():
     return no_cache(send_from_directory("static", "index.html", max_age=0))
+
+
+# --- Paper trading: simulated buys sized as a fixed % of a bankroll --------------------------
+# Replays alerts.csv + outcomes.csv (both saved to GitHub), so a restart never resets it.
+# Two accounts are simulated side by side:
+#   fractional : buys in hundredths of a contract (allowed by Kalshi only in markets that enable it)
+#   whole      : whole contracts only; if 1% buys less than one contract, it buys one (if it can afford it)
+PAPER_START = float(os.getenv("PAPER_START", "10"))
+PAPER_STAKE_PCT = float(os.getenv("PAPER_STAKE_PCT", "1"))      # percent of the current bankroll per buy
+PAPER_SINCE = os.getenv("PAPER_SINCE", "").strip()              # optional ISO time, e.g. 2026-10-03T14:00:00Z
+PAPER_MODE = os.getenv("PAPER_MODE", "fractional").lower()      # which account the top-bar chip shows
+PAPER_STEP = float(os.getenv("PAPER_BALANCE_STEP", "0.0001"))   # 0.0001 = direct Kalshi account; 0.01 = through a broker
+
+
+def _ceil_to(x, step):
+    return math.ceil(round(x / step, 6)) * step  # round() first so 0.1000000000001 does not jump a step
+
+
+def paper_ledger(mode):
+    since = iso(PAPER_SINCE) if PAPER_SINCE else 0.0
+    alerts = sorted(read_csv(ALERTS_CSV), key=lambda r: float(r.get("ts") or 0))
+    outcomes = {r["ticker"]: r["result"] for r in read_csv(OUTCOMES_CSV) if r.get("ticker")}
+    now, bankroll, peak, max_dd = time.time(), PAPER_START, PAPER_START, 0.0
+    pct, trades, open_pos, seen = PAPER_STAKE_PCT / 100.0, [], None, set()
+
+    for r in alerts:
+        t = r.get("ticker")
+        try:
+            ts = float(r.get("ts") or 0)
+            close_ts = ts + float(r.get("seconds_left") or 0)
+        except ValueError:
+            continue
+        if not t or t in seen or ts < (since or 0):
+            continue
+        seen.add(t)
+        try:
+            price = float(r["entry_price"])
+        except (ValueError, KeyError, TypeError):
+            price = None
+        row = {"ts": ts, "ticker": t, "action": r.get("action"), "grade": r.get("grade"), "price": price}
+        if price is None or not 0 < price < 1:
+            trades.append({**row, "status": "skipped (no ask price)"})
+            continue
+
+        target = bankroll * pct
+        fee_each = fee(price)
+        if mode == "whole":
+            qty = max(1, math.floor(target / (price + fee_each)))
+        else:
+            qty = math.floor(target / (price + fee_each) * 100 + 1e-9) / 100
+        if qty <= 0:
+            trades.append({**row, "status": "skipped (1% buys less than 0.01 contract)"})
+            continue
+        fee_total = qty * fee_each
+        cost = _ceil_to(qty * price + fee_total, PAPER_STEP)  # what leaves the balance, fee and rounding included
+        if cost > bankroll + 1e-9:
+            trades.append({**row, "status": "skipped (not enough cash for one contract)"})
+            continue
+        row.update(qty=qty, cost=cost, fee=cost - qty * price, stake_pct_actual=cost / bankroll * 100, bankroll_before=bankroll)
+
+        result = outcomes.get(t)
+        if result is None:
+            if now < close_ts + 1800:
+                open_pos = {"action": r.get("action"), "price": price, "qty": qty, "cost": cost}
+                trades.append({**row, "status": "open"})
+            else:
+                trades.append({**row, "status": "no result recorded"})
+            continue
+
+        won = (r.get("action") == "BUY UP") == (result == "yes")
+        profit = qty - cost if won else -cost  # a winning contract pays $1
+        bankroll += profit
+        peak = max(peak, bankroll)
+        max_dd = max(max_dd, (peak - bankroll) / peak)
+        trades.append({**row, "status": "settled", "won": won, "profit": profit, "bankroll_after": bankroll})
+
+    settled = [x for x in trades if x["status"] == "settled"]
+    return {
+        "mode": mode, "start": PAPER_START, "bankroll": bankroll, "stake_pct": PAPER_STAKE_PCT,
+        "return_pct": (bankroll / PAPER_START - 1) * 100,
+        "settled": len(settled), "wins": sum(1 for x in settled if x["won"]),
+        "skipped": sum(1 for x in trades if x["status"].startswith("skipped")),
+        "avg_stake_pct": sum(x["stake_pct_actual"] for x in settled) / len(settled) if settled else None,
+        "max_drawdown_pct": max_dd * 100, "open": open_pos, "trades": trades,
+    }
+
+
+@app.get("/api/paper")
+def api_paper():
+    out = {"primary": PAPER_MODE if PAPER_MODE in ("fractional", "whole") else "fractional"}
+    for mode in ("fractional", "whole"):
+        data = paper_ledger(mode)
+        data["trades"] = data["trades"][-20:]
+        out[mode] = data
+    return no_cache(jsonify(out))
+
+
+@app.get("/api/paper.csv")
+def api_paper_csv():
+    mode = request.args.get("mode", PAPER_MODE)
+    fields = ["ts", "ticker", "action", "grade", "price", "qty", "cost", "fee", "stake_pct_actual",
+              "status", "won", "profit", "bankroll_before", "bankroll_after"]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore", restval="")
+    w.writeheader()
+    w.writerows(paper_ledger("whole" if mode == "whole" else "fractional")["trades"])
+    return no_cache(Response(buf.getvalue(), mimetype="text/csv",
+                             headers={"Content-Disposition": f"attachment; filename=paper_{mode}.csv"}))
 
 
 if __name__ == "__main__":
