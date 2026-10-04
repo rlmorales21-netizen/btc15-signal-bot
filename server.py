@@ -1511,7 +1511,8 @@ def paper_ledger(mode, rule=None):
                 trades.append({**row, "status": "no result recorded"})
             continue
 
-        won = (r.get("action") == "BUY UP") == (result == "yes")
+        # Grade the same side that was actually chosen at OPEN.
+        won = (action == "BUY UP") == (result == "yes")
         profit = qty - cost if won else -cost  # a winning contract pays $1
         bankroll += profit
         peak = max(peak, bankroll)
@@ -1519,9 +1520,16 @@ def paper_ledger(mode, rule=None):
         trades.append({**row, "status": "settled", "won": won, "profit": profit, "bankroll_after": bankroll})
 
     settled = [x for x in trades if x["status"] == "settled"]
+    realized_pnl = sum(float(x.get("profit") or 0.0) for x in settled)
+    open_cost = float(open_pos.get("cost") or 0.0) if open_pos else 0.0
+    # Bankroll is available cash. Total paper equity includes the cost committed
+    # to an unresolved OPEN position, so an open trade does not look like an
+    # immediate loss in the P/L display.
+    total_equity = bankroll + open_cost
     return {
         "mode": mode, "start": PAPER_START, "bankroll": bankroll, "stake_pct": PAPER_STAKE_PCT,
-        "return_pct": (bankroll / PAPER_START - 1) * 100,
+        "return_pct": (total_equity / PAPER_START - 1) * 100,
+        "realized_pnl": realized_pnl, "open_cost": open_cost, "total_equity": total_equity,
         "settled": len(settled), "wins": sum(1 for x in settled if x["won"]),
         "skipped": sum(1 for x in trades if x["status"].startswith("skipped")),
         "avg_stake_pct": sum(x["stake_pct_actual"] for x in settled) / len(settled) if settled else None,
