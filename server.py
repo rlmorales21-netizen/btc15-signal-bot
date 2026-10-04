@@ -1104,16 +1104,29 @@ OPEN_RULES = [
 ]
 
 
-def open_scoreboard():
+def open_decisions():
+    """Return exactly one official OPEN decision per market, in chronological order.
+
+    This is the single source of truth for the OPEN strategy.  The paper account
+    and the OPEN accuracy scoreboard both consume these same rows, so a market
+    cannot be counted as one side for accuracy and a different side for P&L.
+    """
     outcomes = {r["ticker"]: r["result"] for r in read_csv(OUTCOMES_CSV) if r.get("ticker")}
-    rows, seen, logged = [], set(), set()
+    rows, seen = [], set()
     for r in sorted(read_csv(OPENS_CSV), key=lambda r: float(r.get("ts") or 0)):
         t = r.get("ticker")
         if not t or t in seen:
             continue
         seen.add(t)
-        if t in outcomes:
-            rows.append((r, outcomes[t]))
+        action = r.get("pick_model")
+        if action not in ("BUY UP", "BUY DOWN"):
+            continue
+        rows.append((r, outcomes.get(t)))
+    return rows
+
+
+def open_scoreboard():
+    rows = [(r, result) for r, result in open_decisions() if result is not None]
     out = []
     for col, label in OPEN_RULES:
         bankroll = peak = PAPER_START
@@ -1414,7 +1427,7 @@ def index():
 
 
 # --- Paper trading: simulated buys sized as a fixed % of a bankroll --------------------------
-# Replays alerts.csv + outcomes.csv (both saved to GitHub), so a restart never resets it.
+# Replays the official opens.csv decisions + outcomes.csv, so a restart never resets the OPEN paper history.
 # Two accounts are simulated side by side:
 #   fractional : buys in hundredths of a contract (allowed by Kalshi only in markets that enable it)
 #   whole      : whole contracts only; if 1% buys less than one contract, it buys one (if it can afford it)
@@ -1431,21 +1444,23 @@ def _ceil_to(x, step):
 
 def paper_ledger(mode, rule=None):
     since = iso(PAPER_SINCE) if PAPER_SINCE else 0.0
-    alerts = sorted(read_csv(OPENS_CSV), key=lambda r: float(r.get("ts") or 0))
-    outcomes = {r["ticker"]: r["result"] for r in read_csv(OUTCOMES_CSV) if r.get("ticker")}
     now, bankroll, peak, max_dd = time.time(), PAPER_START, PAPER_START, 0.0
-    pct, trades, open_pos, seen = PAPER_STAKE_PCT / 100.0, [], None, set()
+    pct, trades, open_pos = PAPER_STAKE_PCT / 100.0, [], None
 
-    for r in alerts:
+    # IMPORTANT: the paper trade is the official OPEN decision.
+    # The decision chooses UP/DOWN; the current bankroll determines the stake.
+    # Never use the later 5-minute/checkpoint signal to change the paper side.
+    decisions = open_decisions()
+
+    for r, result in decisions:
         t = r.get("ticker")
         try:
             ts = float(r.get("ts") or 0)
             close_ts = ts + float(r.get("seconds_left") or 0)
         except ValueError:
             continue
-        if not t or t in seen or ts < (since or 0):
+        if not t or ts < (since or 0):
             continue
-        seen.add(t)
         action = r.get("pick_model")
         try:
             price = float(r["yes_ask"] if action == "BUY UP" else r["no_ask"])
@@ -1488,10 +1503,9 @@ def paper_ledger(mode, rule=None):
             continue
         row.update(qty=qty, cost=cost, fee=cost - qty * price, stake_pct_actual=cost / bankroll * 100, bankroll_before=bankroll)
 
-        result = outcomes.get(t)
         if result is None:
             if now < close_ts + 1800:
-                open_pos = {"action": r.get("action"), "price": price, "qty": qty, "cost": cost}
+                open_pos = {"action": action, "price": price, "qty": qty, "cost": cost}
                 trades.append({**row, "status": "open"})
             else:
                 trades.append({**row, "status": "no result recorded"})
