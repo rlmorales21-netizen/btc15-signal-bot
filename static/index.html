@@ -50,7 +50,7 @@ button{padding:5px 10px;border:1px solid var(--line);border-radius:8px;backgroun
 <div class="check" id="check">Waiting for live data…</div>
 <div class="cols">
  <div class="col">
-  <div class="signal wait" id="signal"><h1 id="action">WAIT</h1><div class="prob" id="prob">--</div><div class="edge" id="edge">Waiting for live data…</div></div>
+  <div class="signal wait" id="signal"><h1 id="action">P/L --</h1><div class="prob" id="prob">--</div><div class="edge" id="edge">Waiting for live data…</div></div>
   <div class="g2">
    <div class="card"><div class="k">BTC · proxy (<span id="src">-</span> exch)</div><div class="v" id="btc">--</div></div>
    <div class="card"><div class="k">Target</div><div class="v" id="target">--</div></div>
@@ -121,7 +121,6 @@ function render(d){
  d.sentiment_label?tile("sent",d.sentiment_label,sgn(d.sent)+"%"):$("sent").textContent="--";
  const action=d.action||"WAIT";
  $("signal").className="signal "+(action==="BUY UP"?"up":action==="BUY DOWN"?"down":"wait");
- $("action").textContent=action;
  const r=$("reasons");r.textContent="";
  const rs=(d.reasons||[]).filter(x=>!HIDE.test(x.text||""));
  for(const x of (rs.length?rs:[{type:"neutral",text:"Waiting for signal inputs…"}])){const e=document.createElement("div");e.className=["good","bad"].includes(x.type)?x.type:"";e.textContent=x.text;r.appendChild(e)}
@@ -183,6 +182,9 @@ async function loadPaper(){
   const chip=$("chip");chip.textContent="Paper $"+m.bankroll.toFixed(2);chip.title="Paper bankroll ("+m.mode+"), started at $"+m.start.toFixed(2);
   chip.style.color=m.bankroll>m.start+0.0049?"var(--green)":m.bankroll<m.start-0.0049?"var(--red)":"var(--muted)";
   const pnl=x=>{const v=Number(x.realized_pnl||0);return (v>=0?"+$":"-$")+Math.abs(v).toFixed(2)};
+  const pv=Number(m.realized_pnl||0);
+  $("action").textContent="P/L "+pnl(m);
+  $("action").style.color=pv>0.0001?"var(--green)":pv<-0.0001?"var(--red)":"var(--yellow)";
   const line=x=>x.mode+": $"+x.bankroll.toFixed(2)+" ("+sg(x.return_pct)+") \u00b7 "+x.wins+"/"+x.settled+" won"+(x.avg_stake_pct!=null?" \u00b7 avg buy "+x.avg_stake_pct.toFixed(1)+"% of bankroll":"")+(x.skipped?" \u00b7 "+x.skipped+" skipped":"")+(x.max_drawdown_pct>0?" \u00b7 worst drop -"+x.max_drawdown_pct.toFixed(1)+"%":"");
   const openText=m.open?" \u00b7 open stake "+usd(m.open.cost):"";
   $("paper").textContent="Paper bankroll from $"+m.start.toFixed(2)+", target "+m.stake_pct+"% per buy \u2014 P/L "+pnl(m)+" \u00b7 equity "+usd(m.total_equity)+" \u00b7 "+line(m)+" | "+line(o)+openText+(m.open?" | open: "+m.open.action:"");
