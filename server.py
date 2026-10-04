@@ -79,9 +79,6 @@ TREND_MODE = os.getenv("TREND_MODE", "off").lower()             # "filter" also 
 # Chart indicators (EMA, MACD, RSI, Bollinger, VWAP on 5-minute bars) shift the expected final price.
 TECH_Z = float(os.getenv("TECH_Z", "0.25"))  # max shift, in standard deviations, when the indicators fully agree
 
-# Phone alerts: one check per market when ALERT_AT_SECONDS remain.
-ALERT_AT = float(os.getenv("ALERT_AT_SECONDS", "300"))
-ALERT_WINDOW = float(os.getenv("ALERT_WINDOW_SECONDS", "30"))  # alert fires in [AT-WINDOW, AT]
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -556,7 +553,7 @@ def load_alerted():
 
 
 def notify(title, body, priority="high"):
-    """Push to ntfy.sh and/or Telegram, whichever is configured."""
+    """Push the official open-time decision if alerts are configured."""
     if NTFY_TOPIC:
         try:
             requests.post(
@@ -581,50 +578,38 @@ def notify(title, body, priority="high"):
 
 
 def maybe_alert(s):
-    """Once per market, when the 5:00 decision is made: log it, and push it if alerts are configured."""
-    cp = s.get("checkpoint")
-    if not s.get("ok") or not cp or s["ticker"] in alerted:
+    """Once per market, log and optionally push the OPEN pick as the official decision."""
+    op = s.get("open_pick")
+    if not s.get("ok") or not op or not op.get("action") or s["ticker"] in alerted:
         return
     if len(alerted) > 500:
         alerted.clear()
     alerted.add(s["ticker"])
 
-    price = cp["price"]
+    action = op["action"]
+    price = op.get("price")
+    p_up = float(s.get("p_up") or 0.5)
+    p_pick = p_up if action == "BUY UP" else 1 - p_up
+    grade = "STRONG" if p_pick >= 0.66 else "LEAN" if p_pick >= 0.58 else "COIN FLIP"
+    edge = (p_pick - price - fee(price)) if price is not None else None
+    left = s.get("seconds_left")
     append_row(ALERTS_CSV, ALERT_FIELDS, {
-        "ts": round(time.time(), 2), "ticker": s["ticker"], "action": cp["action"], "grade": cp["grade"],
-        "entry_price": "" if price is None else price, "p_up": round(s["p_up"], 4),
-        "edge": "" if cp["edge"] is None else round(cp["edge"], 4),
-        "seconds_left": round(cp["left"], 1), "btc": s["btc"], "strike": s["strike"],
+        "ts": round(time.time(), 2), "ticker": s["ticker"], "action": action, "grade": grade,
+        "entry_price": "" if price is None else price, "p_up": round(p_up, 4),
+        "edge": "" if edge is None else round(edge, 4),
+        "seconds_left": round(left, 1) if left is not None else "", "btc": s["btc"], "strike": s["strike"],
         "trend": s["trend"]["label"], "trend_ups": s["trend"]["ups"], "trend_n": s["trend"]["n"],
         "tech_score": round(s["tech"]["score"], 3) if s["tech"] else "",
     })
-    left = cp["left"]
-    edge_txt = "n/a" if cp["edge"] is None else f"{cp['edge']*100:+.1f} pts after fees"
     price_txt = "n/a" if price is None else f"{price * 100:.0f}c"
     body = "\n".join([
-        f"{cp['action']} ({cp['grade'].lower()}) at {int(left // 60)}:{int(left % 60):02d} left",
-        f"Model {cp['prob'] * 100:.0f}% | ask {price_txt} | edge {edge_txt}",
+        f"{action} ({grade.lower()}) at market open",
+        f"Model {p_pick * 100:.0f}% for picked side | ask {price_txt}",
         f"BTC (proxy) {s['btc']:,.0f} vs target {s['strike']:,.0f}",
         s["ticker"],
-        "Snapshot only. Check the live price before acting.",
+        "Official open-time paper decision.",
     ])
-    threading.Thread(target=notify, args=(cp["action"], body), daemon=True).start()
-
-
-checkpoints = {}  # ticker -> frozen 5:00 decision
-
-
-def attach_checkpoint(s):
-    """Freeze the decision from the first reading at the 5:00 mark; keep it until the market closes."""
-    if not s.get("ok"):
-        return
-    t, left = s["ticker"], s["seconds_left"]
-    if ALERT_AT - ALERT_WINDOW <= left <= ALERT_AT and t not in checkpoints:
-        checkpoints[t] = {**s["decision"], "left": left}
-    while len(checkpoints) > 20:
-        checkpoints.pop(next(iter(checkpoints)))
-    s["checkpoint"] = checkpoints.get(t)
-    s["alert_at"], s["alert_window"] = ALERT_AT, ALERT_WINDOW
+    threading.Thread(target=notify, args=(action, body), daemon=True).start()
 
 
 def poll_outcomes():
@@ -653,8 +638,21 @@ def poll_outcomes():
 def compute_stats():
     outcomes = {r["ticker"]: r["result"] for r in read_csv(OUTCOMES_CSV)}
     first_signal = {}
-    for r in read_csv(ALERTS_CSV):
-        first_signal.setdefault(r["ticker"], r)
+    for r in read_csv(OPENS_CSV):
+        t = r.get("ticker")
+        if t and t not in first_signal:
+            action = r.get("pick_model")
+            try:
+                price = float(r["yes_ask"] if action == "BUY UP" else r["no_ask"])
+            except (ValueError, KeyError, TypeError):
+                price = None
+            try:
+                p_up = float(r.get("model_p_up") or 0.5)
+            except (ValueError, TypeError):
+                p_up = 0.5
+            p_pick = p_up if action == "BUY UP" else 1 - p_up
+            grade = "STRONG" if p_pick >= 0.66 else "LEAN" if p_pick >= 0.58 else "COIN FLIP"
+            first_signal[t] = {"ticker": t, "action": action, "entry_price": price, "grade": grade}
 
     gaps = []
     for r in read_csv(OUTCOMES_CSV):
@@ -694,7 +692,7 @@ def compute_stats():
         "win_rate": overall["win_rate"],
         "avg_pnl_per_contract": overall["avg_pnl"],
         "by_grade": {g: summarize([x for x in rows if x[0] == g]) for g in ("STRONG", "LEAN", "COIN FLIP")},
-        "note": "5:00 decisions, priced at the ask, minus estimated fees.",
+        "note": "Open-time decisions, priced at the ask, minus estimated fees.",
     }
 
 
@@ -833,17 +831,6 @@ def compute():
         if trend_blocked:
             action = "WAIT"
 
-    # The 5:00 decision is never WAIT: pick the side the model favors, and grade how strong it is.
-    up_side = probability_up >= probability_down
-    d_prob = probability_up if up_side else probability_down
-    decision = {
-        "action": "BUY UP" if up_side else "BUY DOWN",
-        "grade": "STRONG" if action != "WAIT" else "LEAN" if d_prob >= 0.58 else "COIN FLIP",
-        "prob": d_prob,
-        "price": yes_ask if up_side else no_ask,
-        "edge": up_edge if up_side else down_edge,
-        "size": yes_size if up_side else no_size,
-    }
 
     strongest = max(probability_up, probability_down)
     side = "UP" if probability_up >= probability_down else "DOWN"
@@ -917,7 +904,6 @@ def compute():
         "sigma": sigma,
         "trend": trend,
         "trend_blocked": trend_blocked,
-        "decision": decision,
         "tech": tech,
         "momentum": momentum,
         "book": book,
@@ -942,11 +928,6 @@ def update_state():
             "action": "WAIT",
             "error": f"Data update failed: {type(exc).__name__}: {exc}",
         }
-
-    try:
-        attach_checkpoint(new_state)
-    except Exception as exc:
-        feed_errors["checkpoint"] = f"{type(exc).__name__}: {exc}"
 
     try:
         attach_open(new_state)
@@ -1070,7 +1051,7 @@ def attach_open(s):
         return
     opened.add(t)
     picks = dict(feats["picks"]) if feats else {}
-    if s.get("p_up") is not None:  # the 5:00 model (momentum, order book, sentiment, trend, charts, volatility) at the open
+    if s.get("p_up") is not None:  # full model (momentum, order book, sentiment, trend, charts, volatility) at the open
         picks["pick_model"] = _side(s["p_up"] >= 0.5)
     tech = (feats or {}).get("tech") or s.get("tech") or {}
     fx = [v for v in (read("px_" + n)[1] for n in ENABLED) if v is not None]
@@ -1111,7 +1092,7 @@ def _wilson(k, n, z=1.96):
 
 
 OPEN_RULES = [
-    ("pick_model", "ALL INPUTS: the 5:00 model run at the open"),
+    ("pick_model", "ALL INPUTS: full model run at the open"),
     ("pick_vote", "Vote of 3 (4h trend, chart, last 15 min)"),
     ("pick_follow_trend", "Follow the last 4 hours (majority of bars)"),
     ("pick_fade_trend", "Fade the last 4 hours"),
@@ -1450,7 +1431,7 @@ def _ceil_to(x, step):
 
 def paper_ledger(mode, rule=None):
     since = iso(PAPER_SINCE) if PAPER_SINCE else 0.0
-    alerts = sorted(read_csv(ALERTS_CSV), key=lambda r: float(r.get("ts") or 0))
+    alerts = sorted(read_csv(OPENS_CSV), key=lambda r: float(r.get("ts") or 0))
     outcomes = {r["ticker"]: r["result"] for r in read_csv(OUTCOMES_CSV) if r.get("ticker")}
     now, bankroll, peak, max_dd = time.time(), PAPER_START, PAPER_START, 0.0
     pct, trades, open_pos, seen = PAPER_STAKE_PCT / 100.0, [], None, set()
@@ -1465,22 +1446,29 @@ def paper_ledger(mode, rule=None):
         if not t or t in seen or ts < (since or 0):
             continue
         seen.add(t)
+        action = r.get("pick_model")
         try:
-            price = float(r["entry_price"])
+            price = float(r["yes_ask"] if action == "BUY UP" else r["no_ask"])
         except (ValueError, KeyError, TypeError):
             price = None
-        row = {"ts": ts, "ticker": t, "action": r.get("action"), "grade": r.get("grade"), "price": price}
+        try:
+            p_up_row = float(r.get("model_p_up") or 0.5)
+        except (ValueError, TypeError):
+            p_up_row = 0.5
+        p_pick_row = p_up_row if action == "BUY UP" else 1 - p_up_row
+        grade = "STRONG" if p_pick_row >= 0.66 else "LEAN" if p_pick_row >= 0.58 else "COIN FLIP"
+        row = {"ts": ts, "ticker": t, "action": action, "grade": grade, "price": price}
         if price is None or not 0 < price < 1:
             trades.append({**row, "status": "skipped (no ask price)"})
             continue
 
         if rule is not None:
             try:
-                dist, p_up = abs(float(r["btc"]) - float(r["strike"])), float(r["p_up"])
+                dist, p_up = abs(float(r["btc"]) - float(r["strike"])), float(r.get("model_p_up") or 0.5)
             except (ValueError, KeyError, TypeError):
                 dist, p_up = 0.0, 0.5
-            p_pick = p_up if r.get("action") == "BUY UP" else 1 - p_up
-            if not rule({"price": price, "dist": dist, "grade": r.get("grade"), "p_pick": p_pick}):
+            p_pick = p_up if action == "BUY UP" else 1 - p_up
+            if not rule({"price": price, "dist": dist, "grade": grade, "p_pick": p_pick}):
                 trades.append({**row, "status": "skipped (rule)"})
                 continue
 
@@ -1647,7 +1635,7 @@ Paper account: ${PAPER_START:.0f} start, {PAPER_STAKE_PCT:g}% per buy, fractiona
 <div class="w"><table><tr><th>Rule</th><th>Picks</th><th>Won</th><th>Hit rate (95% range)</th><th>Avg price</th><th>Break-even</th><th>Per contract</th><th>Bankroll</th></tr>{''.join(rows)}</table></div>
 <p><b>How to read it:</b> a rule only pays if its hit rate is above the break-even rate (the price plus the fee), and the whole range, not just the middle, should be above it.
 Chance is 50%. Telling a true 55% from 50% takes roughly 400 picks (about 4 days). Until then, treat every row as noise. The two "Always" rows show what a coin flip gets.</p>
-<p><a href="/">Back to the signal</a> &middot; <a href="/rules">5:00 rules</a> &middot; Not financial advice.</p></body></html>"""
+<p><a href="/">Back to the signal</a> &middot; Not financial advice.</p></body></html>"""
     return no_cache(Response(page, mimetype="text/html"))
 
 
