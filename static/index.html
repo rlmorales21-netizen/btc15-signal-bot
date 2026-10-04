@@ -151,10 +151,21 @@ function render(d){
 }
 async function loadStats(){
  try{
-  const t=await (await fetch("/api/stats",{cache:"no-store"})).json();
+  // Accuracy must come from the same OPEN pick stream that feeds paper trading.
+  // /api/stats also contains the legacy signal/checkpoint history, so using it here
+  // can make the displayed open record disagree with the paper bankroll.
+  const [t,o]=await Promise.all([
+   (await fetch("/api/stats",{cache:"no-store"})).json(),
+   (await fetch("/api/open",{cache:"no-store"})).json()
+  ]);
   const gap=t.ref_gap_samples?" · Proxy vs Kalshi settle: typical gap $"+t.ref_gap_mean_abs.toFixed(2)+" ("+t.ref_gap_samples+" mkts)":"";
-  $("stats").textContent=!t.signals_resolved?"Track record: "+t.markets_resolved+" markets settled, no open decisions yet."+gap
-   :"Open decisions: "+t.wins+"/"+t.signals_resolved+" won ("+(t.win_rate*100).toFixed(0)+"%)"+(t.avg_pnl_per_contract==null?"":" · avg "+(t.avg_pnl_per_contract>=0?"+":"-")+"$"+Math.abs(t.avg_pnl_per_contract).toFixed(3)+"/contract after fees")+Object.entries(t.by_grade||{}).filter(([g,x])=>x.n).map(([g,x])=>" · "+g.toLowerCase()+" "+x.wins+"/"+x.n).join("")+gap;
+  const r=(o.rules||[]).find(x=>x.col==="pick_model") || (o.rules||[])[0];
+  if(!r || !r.n){
+   $("stats").textContent="Track record: "+(o.decisions_logged||0)+" open decisions logged, none settled yet."+gap;
+  }else{
+   $("stats").textContent="Open decisions: "+r.wins+"/"+r.n+" won ("+(r.hit*100).toFixed(0)+"%)"
+    +(r.per_contract==null?"":" · avg "+(r.per_contract>=0?"+":"-")+"$"+Math.abs(r.per_contract).toFixed(3)+"/contract after fees")+gap;
+  }
  }catch(e){$("stats").textContent=""}
 }
 function connect(){
@@ -171,8 +182,10 @@ async function loadPaper(){
   const sg=x=>(x>=0?"+":"-")+Math.abs(x).toFixed(1)+"%";
   const chip=$("chip");chip.textContent="Paper $"+m.bankroll.toFixed(2);chip.title="Paper bankroll ("+m.mode+"), started at $"+m.start.toFixed(2);
   chip.style.color=m.bankroll>m.start+0.0049?"var(--green)":m.bankroll<m.start-0.0049?"var(--red)":"var(--muted)";
+  const pnl=x=>{const v=Number(x.realized_pnl||0);return (v>=0?"+$":"-$")+Math.abs(v).toFixed(2)};
   const line=x=>x.mode+": $"+x.bankroll.toFixed(2)+" ("+sg(x.return_pct)+") \u00b7 "+x.wins+"/"+x.settled+" won"+(x.avg_stake_pct!=null?" \u00b7 avg buy "+x.avg_stake_pct.toFixed(1)+"% of bankroll":"")+(x.skipped?" \u00b7 "+x.skipped+" skipped":"")+(x.max_drawdown_pct>0?" \u00b7 worst drop -"+x.max_drawdown_pct.toFixed(1)+"%":"");
-  $("paper").textContent="Paper bankroll from $"+m.start.toFixed(2)+", target "+m.stake_pct+"% per buy \u2014 "+line(m)+" | "+line(o)+(m.open?" | open: "+m.open.action:"");
+  const openText=m.open?" \u00b7 open stake "+usd(m.open.cost):"";
+  $("paper").textContent="Paper bankroll from $"+m.start.toFixed(2)+", target "+m.stake_pct+"% per buy \u2014 P/L "+pnl(m)+" \u00b7 equity "+usd(m.total_equity)+" \u00b7 "+line(m)+" | "+line(o)+openText+(m.open?" | open: "+m.open.action:"");
  }catch(e){$("paper").textContent="";$("chip").textContent=""}
 }
 loadPaper();setInterval(loadPaper,60000);
