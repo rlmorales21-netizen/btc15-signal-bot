@@ -948,6 +948,11 @@ def update_state():
     except Exception as exc:
         feed_errors["checkpoint"] = f"{type(exc).__name__}: {exc}"
 
+    try:
+        attach_open(new_state)
+    except Exception as exc:
+        feed_errors["open_pick"] = f"{type(exc).__name__}: {exc}"
+
     with state_changed:
         state = new_state
         state_changed.notify_all()
@@ -966,6 +971,203 @@ def loop():
         time.sleep(0.5)
 
 
+# --- Open-time picks: choose UP/DOWN the moment a new market opens -----------------------------
+# At the open both sides cost about 50 cents, so a pick only has to beat roughly 52% to pay.
+# Several candidate rules are logged side by side (see /open); the results show which, if any, works.
+OPEN_WINDOW = float(os.getenv("OPEN_WINDOW_SECONDS", "45"))
+OPEN_FIELDS = ["ts", "ticker", "seconds_left", "btc", "strike", "yes_bid", "yes_ask", "no_bid", "no_ask",
+               "prev_dir", "prev_move_pct", "streak", "bars_up", "bars_n", "tech_score",
+               "pick_model", "pick_vote", "pick_follow_prev", "pick_reverse_prev", "pick_follow_trend", "pick_fade_trend", "pick_chart",
+               "model_p_up", "momentum", "book", "sentiment", "sigma", "kalshi_trend_ups", "kalshi_trend_n",
+               "tech_ema", "tech_macd", "tech_vwap", "tech_rsi", "tech_pctb", "vol_ratio",
+               "move_3bars_pct", "move_16bars_pct", "prev_vol_ratio", "px_spread", "yes_ask_size", "no_ask_size", "hour_utc"]
+OPENS_CSV = os.path.join(LOG_DIR, "opens.csv")
+opened = set()
+open_cache = {}  # ticker -> the primary open pick, for the page
+
+
+def _side(up):
+    return "BUY UP" if up else "BUY DOWN"
+
+
+def open_features(candles, btc, now):
+    """Look back over completed 15-minute bars (built from 1-minute candles) and make each candidate pick."""
+    cur = int(now // 900 * 900)
+    bars = [b for b in aggregate(candles, 900) if b[0] < cur]  # (time, open, high, low, close, volume)
+    if len(bars) < 8 or bars[-1][0] != cur - 900:  # need the quarter-hour that just ended
+        return None
+    dirs = [1 if b[4] >= b[1] else -1 for b in bars[-16:]]
+    prev, streak = dirs[-1], 1
+    for d in reversed(dirs[:-1]):
+        if d != prev:
+            break
+        streak += 1
+    ups, n = sum(1 for d in dirs if d > 0), len(dirs)
+    trend_up = prev > 0 if ups * 2 == n else ups * 2 > n  # exact tie follows the last bar
+    tech = chart_indicators(candles, btc)
+    last16 = bars[-16:]
+    avg_vol = sum(b[5] for b in last16) / len(last16)
+    score = tech["score"] if tech else None
+    chart_up = None if score is None else score >= 0
+    votes = [trend_up, prev > 0] + ([] if chart_up is None else [chart_up])
+    vote_up = sum(votes) * 2 > len(votes) if len(votes) % 2 else trend_up  # two voters that disagree: trend wins
+    return {
+        "prev_dir": "UP" if prev > 0 else "DOWN", "prev_move_pct": (bars[-1][4] / bars[-1][1] - 1) * 100,
+        "streak": streak, "bars_up": ups, "bars_n": n, "tech_score": score, "tech": tech,
+        "move_3bars_pct": (bars[-1][4] / bars[-3][1] - 1) * 100,
+        "move_16bars_pct": (bars[-1][4] / last16[0][1] - 1) * 100,
+        "prev_vol_ratio": bars[-1][5] / avg_vol if avg_vol > 0 else "",
+        "picks": {
+            "pick_vote": _side(vote_up), "pick_follow_prev": _side(prev > 0), "pick_reverse_prev": _side(prev < 0),
+            "pick_follow_trend": _side(trend_up), "pick_fade_trend": _side(not trend_up),
+            "pick_chart": "" if chart_up is None else _side(chart_up),
+        },
+    }
+
+
+def load_opened():
+    for r in read_csv(OPENS_CSV):
+        t = r.get("ticker")
+        if not t:
+            continue
+        opened.add(t)
+        side = r.get("pick_model") or r.get("pick_vote")
+        try:
+            price = float(r["yes_ask"] if side == "BUY UP" else r["no_ask"])
+        except (ValueError, KeyError, TypeError):
+            price = None
+        open_cache[t] = {"action": side or None, "price": price, "rule": "all inputs"}
+
+
+def pending_from_opens():
+    settled = {r["ticker"] for r in read_csv(OUTCOMES_CSV)}
+    for r in read_csv(OPENS_CSV):
+        t = r.get("ticker")
+        if t and t not in settled:
+            try:
+                pending[t] = float(r["ts"]) + float(r["seconds_left"])
+            except (ValueError, KeyError, TypeError):
+                pass
+
+
+def attach_open(s):
+    """In the first seconds of a market, make and log the open pick (once per market)."""
+    if not s.get("ok"):
+        return
+    t, left = s["ticker"], s["seconds_left"]
+    if t in opened:
+        s["open_pick"] = open_cache.get(t)
+        return
+    if not (900 - OPEN_WINDOW <= left <= 900):  # only right after a market opens
+        s["open_pick"] = None
+        return
+    now = time.time()
+    c_ts, candles = read("candles")
+    feats = open_features(candles, s["btc"], now) if candles and now - c_ts < 180 else None
+    ready = feats is not None and s.get("yes_ask") and s.get("no_ask")
+    if not ready and left > 900 - OPEN_WINDOW + 3:  # give data and prices a few seconds to appear
+        s["open_pick"] = None
+        return
+    opened.add(t)
+    picks = dict(feats["picks"]) if feats else {}
+    if s.get("p_up") is not None:  # the 5:00 model (momentum, order book, sentiment, trend, charts, volatility) at the open
+        picks["pick_model"] = _side(s["p_up"] >= 0.5)
+    tech = (feats or {}).get("tech") or s.get("tech") or {}
+    fx = [v for v in (read("px_" + n)[1] for n in ENABLED) if v is not None]
+    tr = s.get("trend") or {}
+    row = {
+        "ts": round(now, 2), "ticker": t, "seconds_left": round(left, 1), "btc": s["btc"], "strike": s["strike"],
+        "yes_bid": s.get("yes_bid"), "yes_ask": s.get("yes_ask"), "no_bid": s.get("no_bid"), "no_ask": s.get("no_ask"),
+        "prev_dir": feats["prev_dir"] if feats else "", "streak": feats["streak"] if feats else "",
+        "prev_move_pct": round(feats["prev_move_pct"], 4) if feats else "",
+        "bars_up": feats["bars_up"] if feats else "", "bars_n": feats["bars_n"] if feats else "",
+        "tech_score": "" if not feats or feats["tech_score"] is None else round(feats["tech_score"], 3), **picks,
+        "model_p_up": round(s["p_up"], 4) if s.get("p_up") is not None else "",
+        "momentum": round(s.get("momentum") or 0, 4), "book": round(s.get("book") or 0, 4), "sentiment": round(s.get("sent") or 0, 4),
+        "sigma": s.get("sigma", ""), "kalshi_trend_ups": tr.get("ups", ""), "kalshi_trend_n": tr.get("n", ""),
+        "tech_ema": round(tech["ema"], 3) if tech else "", "tech_macd": round(tech["macd"], 3) if tech else "",
+        "tech_vwap": round(tech["vwap"], 3) if tech else "", "tech_rsi": round(tech["rsi"], 1) if tech else "",
+        "tech_pctb": round(tech["pctb"], 3) if tech else "", "vol_ratio": round(tech["vol_ratio"], 3) if tech else "",
+        "move_3bars_pct": round(feats["move_3bars_pct"], 4) if feats else "",
+        "move_16bars_pct": round(feats["move_16bars_pct"], 4) if feats else "",
+        "prev_vol_ratio": round(feats["prev_vol_ratio"], 3) if feats and feats["prev_vol_ratio"] != "" else "",
+        "px_spread": round(max(fx) - min(fx), 2) if len(fx) >= 2 else "",
+        "yes_ask_size": s.get("yes_ask_size"), "no_ask_size": s.get("no_ask_size"), "hour_utc": time.gmtime(now).tm_hour,
+    }
+    append_row(OPENS_CSV, OPEN_FIELDS, row)
+    pending[t] = now + left
+    side = picks.get("pick_model") or picks.get("pick_vote")
+    price = (s.get("yes_ask") if side == "BUY UP" else s.get("no_ask")) if side else None
+    open_cache[t] = {"action": side or None, "price": price, "rule": "all inputs"}
+    if len(open_cache) > 50:
+        open_cache.pop(next(iter(open_cache)))
+    s["open_pick"] = open_cache[t]
+
+
+def _wilson(k, n, z=1.96):
+    p, den = k / n, 1 + z * z / n
+    c, h = (p + z * z / (2 * n)) / den, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return c - h, c + h
+
+
+OPEN_RULES = [
+    ("pick_model", "ALL INPUTS: the 5:00 model run at the open"),
+    ("pick_vote", "Vote of 3 (4h trend, chart, last 15 min)"),
+    ("pick_follow_trend", "Follow the last 4 hours (majority of bars)"),
+    ("pick_fade_trend", "Fade the last 4 hours"),
+    ("pick_follow_prev", "Same direction as the last 15 minutes"),
+    ("pick_reverse_prev", "Opposite of the last 15 minutes"),
+    ("pick_chart", "Chart indicators (sign of the score)"),
+    ("always_up", "Always UP (control)"),
+    ("always_down", "Always DOWN (control)"),
+]
+
+
+def open_scoreboard():
+    outcomes = {r["ticker"]: r["result"] for r in read_csv(OUTCOMES_CSV) if r.get("ticker")}
+    rows, seen, logged = [], set(), set()
+    for r in sorted(read_csv(OPENS_CSV), key=lambda r: float(r.get("ts") or 0)):
+        t = r.get("ticker")
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        if t in outcomes:
+            rows.append((r, outcomes[t]))
+    out = []
+    for col, label in OPEN_RULES:
+        bankroll = peak = PAPER_START
+        dd, n, wins, skipped, prices, pnl, be = 0.0, 0, 0, 0, [], [], []
+        for r, result in rows:
+            side = "BUY UP" if col == "always_up" else "BUY DOWN" if col == "always_down" else r.get(col)
+            try:
+                price = float(r["yes_ask"] if side == "BUY UP" else r["no_ask"])
+            except (ValueError, KeyError, TypeError):
+                price = None
+            if side not in ("BUY UP", "BUY DOWN") or price is None or not 0 < price < 1:
+                skipped += 1
+                continue
+            won = (side == "BUY UP") == (result == "yes")
+            n, wins = n + 1, wins + won
+            prices.append(price)
+            be.append(price + fee(price))
+            pnl.append((1 - price if won else -price) - fee(price))
+            f1 = fee(price)
+            qty = math.floor(bankroll * PAPER_STAKE_PCT / 100 / (price + f1) * 100 + 1e-9) / 100
+            cost = _ceil_to(qty * price + qty * f1, PAPER_STEP)
+            if qty > 0 and cost <= bankroll + 1e-9:
+                bankroll += (qty - cost) if won else -cost
+                peak = max(peak, bankroll)
+                dd = max(dd, (peak - bankroll) / peak)
+        lo, hi = _wilson(wins, n) if n else (None, None)
+        out.append({
+            "col": col, "rule": label, "n": n, "wins": wins, "hit": wins / n if n else None, "lo": lo, "hi": hi,
+            "avg_price": sum(prices) / n if n else None, "breakeven": sum(be) / n if n else None,
+            "per_contract": sum(pnl) / n if n else None, "bankroll": bankroll,
+            "return_pct": (bankroll / PAPER_START - 1) * 100, "max_drawdown_pct": dd * 100, "skipped": skipped,
+        })
+    return {"decisions_logged": len(seen), "settled": len(rows), "rules": out}
+
+
 # --- Optional: save results to a private GitHub repo so they survive Render restarts ---------
 # Inactive unless GITHUB_TOKEN and GITHUB_DATA_REPO are set. Saves only alerts.csv and
 # outcomes.csv (a few rows per market). On startup it merges the saved copy back in.
@@ -978,7 +1180,8 @@ GH_REPO = os.getenv("GITHUB_DATA_REPO", "").strip()           # "owner/name"
 GH_BRANCH = os.getenv("GITHUB_DATA_BRANCH", "main").strip()
 GH_API = os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 GH_ENABLED = bool(GH_TOKEN and GH_REPO)
-GH_FILES = {"alerts.csv": (ALERTS_CSV, ALERT_FIELDS), "outcomes.csv": (OUTCOMES_CSV, OUTCOME_FIELDS)}
+GH_FILES = {"alerts.csv": (ALERTS_CSV, ALERT_FIELDS), "outcomes.csv": (OUTCOMES_CSV, OUTCOME_FIELDS),
+            "opens.csv": (OPENS_CSV, OPEN_FIELDS)}
 _gh_state = {n: {"ready": False, "sha": None, "remote_lines": 0, "pushed_hash": None} for n in GH_FILES}
 _gh_lock = threading.Lock()
 
@@ -1083,6 +1286,8 @@ def github_sync():
         if gained:
             load_alerted()
             pending_from_alerts()
+            load_opened()
+            pending_from_opens()
         for name in GH_FILES:
             _gh_push_file(name)
     finally:
@@ -1109,6 +1314,8 @@ def start_price_feeds():
 restore_from_github()  # does nothing unless GITHUB_TOKEN and GITHUB_DATA_REPO are set
 load_pending()
 load_alerted()
+load_opened()
+pending_from_opens()
 if ALERT_ON_START and (NTFY_TOPIC or (TG_TOKEN and TG_CHAT)):
     threading.Thread(
         target=notify,
@@ -1241,7 +1448,7 @@ def _ceil_to(x, step):
     return math.ceil(round(x / step, 6)) * step  # round() first so 0.1000000000001 does not jump a step
 
 
-def paper_ledger(mode):
+def paper_ledger(mode, rule=None):
     since = iso(PAPER_SINCE) if PAPER_SINCE else 0.0
     alerts = sorted(read_csv(ALERTS_CSV), key=lambda r: float(r.get("ts") or 0))
     outcomes = {r["ticker"]: r["result"] for r in read_csv(OUTCOMES_CSV) if r.get("ticker")}
@@ -1266,6 +1473,16 @@ def paper_ledger(mode):
         if price is None or not 0 < price < 1:
             trades.append({**row, "status": "skipped (no ask price)"})
             continue
+
+        if rule is not None:
+            try:
+                dist, p_up = abs(float(r["btc"]) - float(r["strike"])), float(r["p_up"])
+            except (ValueError, KeyError, TypeError):
+                dist, p_up = 0.0, 0.5
+            p_pick = p_up if r.get("action") == "BUY UP" else 1 - p_up
+            if not rule({"price": price, "dist": dist, "grade": r.get("grade"), "p_pick": p_pick}):
+                trades.append({**row, "status": "skipped (rule)"})
+                continue
 
         target = bankroll * pct
         fee_each = fee(price)
@@ -1331,6 +1548,107 @@ def api_paper_csv():
     w.writerows(paper_ledger("whole" if mode == "whole" else "fractional")["trades"])
     return no_cache(Response(buf.getvalue(), mimetype="text/csv",
                              headers={"Content-Disposition": f"attachment; filename=paper_{mode}.csv"}))
+
+
+# --- Rule scoreboard: the same paper account, run under different "only buy when..." rules ----
+# The signal still picks a side every market (so accuracy keeps being measured); a rule only decides
+# whether the paper account buys. Rules were chosen after looking at results up to RULES_CUTOFF, so
+# only decisions AFTER that time are an honest test.
+import html as _html
+
+RULES_CUTOFF = os.getenv("RULES_CUTOFF", "2026-10-04T02:45:00Z")
+PAPER_RULES = [
+    ("All trades (what the bot does now)", lambda f: True),
+    ("Skip when BTC is within $15 of the target", lambda f: f["dist"] >= 15),
+    ("Skip coin-flip picks", lambda f: f["grade"] != "COIN FLIP"),
+    ("Ask 80\u00a2 or less, and $15+ from target", lambda f: f["price"] <= 0.80 and f["dist"] >= 15),
+    ("Only when the model beats the ask by 5+ pts", lambda f: f["p_pick"] - f["price"] >= 0.05),
+    ("Ask 70\u00a2 or less (cheap prices)", lambda f: f["price"] <= 0.70),
+]
+
+
+def rules_scoreboard():
+    cutoff = iso(RULES_CUTOFF) if RULES_CUTOFF else 0.0
+    out = []
+    for name, rule in PAPER_RULES:
+        L = paper_ledger("fractional", rule)
+        new = [t for t in L["trades"] if t["status"] == "settled" and t["ts"] >= cutoff]
+        out.append({
+            "rule": name, "trades": L["settled"], "wins": L["wins"], "bankroll": L["bankroll"],
+            "return_pct": L["return_pct"], "max_drawdown_pct": L["max_drawdown_pct"],
+            "new_trades": len(new), "new_wins": sum(1 for t in new if t["won"]),
+            "new_profit": sum(t["profit"] for t in new),
+        })
+    return out
+
+
+@app.get("/api/rules")
+def api_rules():
+    return no_cache(jsonify({"cutoff": RULES_CUTOFF, "rules": rules_scoreboard()}))
+
+
+@app.get("/rules")
+def rules_page():
+    rows = []
+    for x in rules_scoreboard():
+        pr = f"{x['new_profit']:+.2f}" if x["new_trades"] else "-"
+        rows.append(
+            f"<tr><td>{_html.escape(x['rule'])}</td><td>{x['trades']}</td><td>{x['wins']}</td>"
+            f"<td>${x['bankroll']:.2f}</td><td>{x['return_pct']:+.1f}%</td><td>-{x['max_drawdown_pct']:.1f}%</td>"
+            f"<td class='n'>{x['new_trades']}</td><td class='n'>{x['new_wins']}</td><td class='n'>{pr}</td></tr>"
+        )
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Rule scoreboard</title>
+<style>body{{margin:0;padding:14px;background:#0b0f14;color:#f5f7fa;font-family:system-ui,sans-serif;font-size:14px}}
+h1{{font-size:18px;margin:0 0 4px}}p{{color:#93a0b3;font-size:12px;line-height:1.4;margin:6px 0}}
+.w{{overflow-x:auto;margin-top:10px}}table{{border-collapse:collapse;min-width:640px;width:100%}}
+th,td{{padding:7px 8px;border-bottom:1px solid #26303c;text-align:right;white-space:nowrap}}
+th:first-child,td:first-child{{text-align:left;white-space:normal;min-width:190px}}th{{color:#93a0b3;font-weight:600;font-size:11px}}
+td.n{{background:#141a22}}a{{color:#23d17a}}</style></head><body>
+<h1>Rule scoreboard</h1>
+<p>Same paper account ($ {PAPER_START:.0f} start, {PAPER_STAKE_PCT:g}% per buy, fractional contracts, estimated fees) under different "only buy when..." rules. The signal still picks a side every market.</p>
+<div class="w"><table><tr><th>Rule</th><th>Trades</th><th>Won</th><th>Bankroll</th><th>Return</th><th>Worst drop</th>
+<th>New trades</th><th>New won</th><th>New profit $</th></tr>{''.join(rows)}</table></div>
+<p><b>Left columns are in-sample:</b> these rules were chosen after seeing results up to {_html.escape(RULES_CUTOFF)}, so they flatter every rule.
+<b>The shaded "New" columns count only decisions after that time</b> - that is the honest test. Wait for 100+ new decisions before drawing conclusions.</p>
+<p><a href="/">Back to the signal</a> &middot; Not financial advice.</p></body></html>"""
+    return no_cache(Response(page, mimetype="text/html"))
+
+
+@app.get("/api/open")
+def api_open():
+    return no_cache(jsonify(open_scoreboard()))
+
+
+@app.get("/open")
+def open_page():
+    sb = open_scoreboard()
+    rows = []
+    for x in sb["rules"]:
+        if x["n"]:
+            hit = f"{x['hit']*100:.0f}% <span>({x['lo']*100:.0f}-{x['hi']*100:.0f}%)</span>"
+            body = (f"<td>{x['n']}</td><td>{x['wins']}</td><td>{hit}</td><td>{x['avg_price']*100:.0f}\u00a2</td>"
+                    f"<td>{x['breakeven']*100:.1f}%</td><td>{x['per_contract']:+.3f}</td>"
+                    f"<td>${x['bankroll']:.2f} ({x['return_pct']:+.1f}%)</td>")
+        else:
+            body = "<td>0</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>"
+        rows.append(f"<tr><td>{_html.escape(x['rule'])}</td>{body}</tr>")
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Open picks</title>
+<style>body{{margin:0;padding:14px;background:#0b0f14;color:#f5f7fa;font-family:system-ui,sans-serif;font-size:14px}}
+h1{{font-size:18px;margin:0 0 4px}}p{{color:#93a0b3;font-size:12px;line-height:1.4;margin:6px 0}}
+.w{{overflow-x:auto;margin-top:10px}}table{{border-collapse:collapse;min-width:620px;width:100%}}
+th,td{{padding:7px 8px;border-bottom:1px solid #26303c;text-align:right;white-space:nowrap}}
+th:first-child,td:first-child{{text-align:left;white-space:normal;min-width:200px}}th{{color:#93a0b3;font-weight:600;font-size:11px}}
+td span{{color:#93a0b3;font-size:11px}}a{{color:#23d17a}}</style></head><body>
+<h1>Open-time picks</h1>
+<p>Each rule picks UP or DOWN in the first seconds of every new market, at the ask then. {sb['decisions_logged']} markets logged, {sb['settled']} settled and scored.
+Paper account: ${PAPER_START:.0f} start, {PAPER_STAKE_PCT:g}% per buy, fractional contracts, estimated fees.</p>
+<div class="w"><table><tr><th>Rule</th><th>Picks</th><th>Won</th><th>Hit rate (95% range)</th><th>Avg price</th><th>Break-even</th><th>Per contract</th><th>Bankroll</th></tr>{''.join(rows)}</table></div>
+<p><b>How to read it:</b> a rule only pays if its hit rate is above the break-even rate (the price plus the fee), and the whole range, not just the middle, should be above it.
+Chance is 50%. Telling a true 55% from 50% takes roughly 400 picks (about 4 days). Until then, treat every row as noise. The two "Always" rows show what a coin flip gets.</p>
+<p><a href="/">Back to the signal</a> &middot; <a href="/rules">5:00 rules</a> &middot; Not financial advice.</p></body></html>"""
+    return no_cache(Response(page, mimetype="text/html"))
 
 
 if __name__ == "__main__":
