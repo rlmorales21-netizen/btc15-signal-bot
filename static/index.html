@@ -74,7 +74,7 @@ button{padding:5px 10px;border:1px solid var(--line);border-radius:8px;backgroun
   <div class="rec" id="paper"></div>
  </div>
 </div>
-<div class="foot"><span class="err" id="error"></span><span>Signal only, no orders placed.</span><button onclick="location.reload()">Reconnect</button></div>
+<div class="foot"><span class="err" id="error"></span><span>Signal only, no orders placed. <a href="/rules" style="color:var(--green)">Rules</a> \u00b7 <a href="/open" style="color:var(--green)">Open picks</a></span><button onclick="location.reload()">Reconnect</button></div>
 </main>
 <script>
 let countdownEndMs=null,lastCloseTime=null,es=null;
@@ -129,6 +129,7 @@ function render(d){
  n.style.display=hl.length?"":"none";
  $("error").textContent=d.error||"";
  renderCheck(d);
+ if(d.open_pick&&d.open_pick.action){const ck=$("check");ck.textContent+=" \u00b7 open pick: "+d.open_pick.action.replace("BUY ","")+(d.open_pick.price!=null?" @"+Math.round(d.open_pick.price*100)+"\u00a2":"")}
  const tc=$("tech");tc.textContent="";
  const T=d.tech;
  if(T){
